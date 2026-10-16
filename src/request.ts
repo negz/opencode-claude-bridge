@@ -5,15 +5,20 @@ import { readFileSync } from "node:fs";
 import { hostname, userInfo } from "node:os";
 import { join } from "node:path";
 import {
+  ANTHROPIC_VERSION,
   BETA_FLAGS,
   BILLING_CCH,
+  CLEAR_THINKING_TYPE,
   CLI_BUILD_ID,
   CLI_VERSION,
+  DEFAULT_EFFORT,
   ENTRYPOINT,
   OAUTH_BETA_FLAG,
   PROFILE_URL,
+  STAINLESS_HEADERS,
   USER_AGENT,
 } from "./constants.js";
+import { computeFingerprint, extractFirstUserMessageText } from "./claude-tools.js";
 
 export type OAuthProfile = {
   account?: { uuid?: string };
@@ -251,4 +256,184 @@ export async function fetchOAuthProfile(accessToken: string): Promise<OAuthProfi
 
   oauthProfileCache.set(accessToken, pending);
   return pending;
+}
+/** Rewrite OpenCode's Anthropic request headers to the ones Claude Code sends. */
+export function buildClaudeHeaders(
+  source: Headers,
+  accessToken: string,
+  sessionId: string,
+): Headers {
+  const headers = new Headers(source);
+  headers.set("authorization", `Bearer ${accessToken}`);
+  headers.delete("x-api-key");
+  headers.delete("x-session-affinity");
+  headers.delete("x-session-id");
+  if (!headers.has("accept")) headers.set("accept", "application/json");
+  headers.set("user-agent", USER_AGENT);
+  headers.set("x-app", "cli");
+  headers.set("x-claude-code-session-id", sessionId);
+  headers.set("anthropic-version", ANTHROPIC_VERSION);
+  headers.set("anthropic-dangerous-direct-browser-access", "true");
+  for (const [k, v] of Object.entries(STAINLESS_HEADERS)) headers.set(k, v);
+  if (!headers.has("x-stainless-retry-count")) headers.set("x-stainless-retry-count", "0");
+  if (!headers.has("x-stainless-timeout")) headers.set("x-stainless-timeout", "600");
+  headers.set("anthropic-beta", buildBetaFlags(headers.get("anthropic-beta") || ""));
+  return headers;
+}
+
+// Only inject adaptive thinking for models that support it.
+// Use an explicit allowlist — haiku and older sonnet variants
+// (e.g. claude-sonnet-4-5) reject the field entirely.
+// claude-sonnet-4-6 and claude-opus-4-x are confirmed to support
+// interleaved-thinking-2025-05-14.
+const THINKING_MODELS = [
+  "claude-opus-4",
+  "claude-sonnet-4-6",
+];
+
+export type ClaudeBodyOptions = {
+  sessionId: string;
+  deviceId: string;
+  /** Token used to look up the account UUID for request metadata. */
+  accessToken?: string;
+  cachedClaudePromptCache: ClaudeSystemPromptCache | null;
+  /** Swap OpenCode's tool definitions and tool_choice for Claude Code's tools. */
+  replaceTools?: (parsed: any, requestUrl: string) => void;
+  /** Translate a historical tool_use block to the matching Claude Code tool. */
+  translateToolUse?: (block: any) => void;
+};
+
+/** Rewrite a parsed Anthropic Messages request body to look like Claude Code's. */
+export async function shapeClaudeBody(
+  parsed: any,
+  requestUrl: string,
+  options: ClaudeBodyOptions,
+): Promise<void> {
+  const { sessionId, deviceId, cachedClaudePromptCache } = options;
+  const cachedClaudeSystem = cachedClaudePromptCache?.system || null;
+
+  const supportsThinking = parsed.model &&
+    THINKING_MODELS.some((m: string) => parsed.model.includes(m));
+  if (!parsed.thinking && supportsThinking) {
+    parsed.thinking = { type: "adaptive" };
+  }
+
+  // Anthropic requires temperature=1 when thinking is enabled/adaptive
+  const thinkingType = parsed.thinking?.type;
+  if (
+    (thinkingType === "enabled" || thinkingType === "adaptive") &&
+    parsed.temperature !== undefined &&
+    parsed.temperature !== 1
+  ) {
+    parsed.temperature = 1;
+  }
+
+  if (!parsed.system) parsed.system = [];
+  if (Array.isArray(parsed.messages)) {
+    parsed.messages = stripAssistantPrefillForClaude(parsed.messages);
+  }
+  // context_management and output_config.effort are only
+  // supported by thinking-capable models. Sending them to
+  // haiku (used for title generation) produces a 400.
+  if (supportsThinking) {
+    if (!parsed.context_management) {
+      parsed.context_management = {
+        edits: [{ type: CLEAR_THINKING_TYPE, keep: "all" }],
+      };
+    }
+    if (!parsed.output_config) {
+      parsed.output_config = { effort: DEFAULT_EFFORT };
+    }
+  }
+
+  const profile = options.accessToken
+    ? await fetchOAuthProfile(options.accessToken)
+    : null;
+  if (!parsed.metadata) parsed.metadata = {};
+  if (!parsed.metadata.user_id && profile?.account?.uuid) {
+    parsed.metadata.user_id = JSON.stringify({
+      device_id: deviceId,
+      account_uuid: profile.account.uuid,
+      session_id: sessionId,
+    });
+  }
+
+  // Compute dynamic fingerprint from the first user message
+  // (matches Claude Code's per-request fingerprint behavior).
+  let dynamicFingerprint: string | undefined;
+  if (parsed.messages && Array.isArray(parsed.messages)) {
+    const firstText = extractFirstUserMessageText(parsed.messages);
+    if (firstText) {
+      dynamicFingerprint = computeFingerprint(firstText);
+    }
+  }
+
+  // Inject billing header as first system block (required for OAuth).
+  const hasBilling = parsed.system.some(
+    (s: { text?: string }) =>
+      s.text?.startsWith("x-anthropic-billing-header:"),
+  );
+  let billingHeader = buildBillingHeader(sessionId, cachedClaudePromptCache, dynamicFingerprint);
+  if (!hasBilling) {
+    parsed.system.unshift({
+      type: "text",
+      text: billingHeader,
+    });
+  } else {
+    billingHeader = parsed.system[0]?.text || billingHeader;
+  }
+
+  // If we have a locally captured Claude Code system prompt, prefer it.
+  if (cachedClaudeSystem) {
+    const rewritten = rewriteSystemBlocksForModel(
+      cachedClaudeSystem,
+      typeof parsed.model === "string" ? parsed.model : undefined,
+    );
+    parsed.system = [
+      { type: "text", text: billingHeader },
+      ...rewritten,
+    ];
+  } else if (parsed.system && Array.isArray(parsed.system)) {
+    // Otherwise keep the existing prompt but shape it closer to Claude Code.
+    parsed.system = normalizeSystemBlocks(parsed.system);
+  }
+  parsed.system = stripSystemCacheControl(parsed.system);
+
+  options.replaceTools?.(parsed, requestUrl);
+
+  // Normalize message content blocks:
+  // - Translate tool names and arguments, if the caller does that
+  // - Clean up text blocks
+  if (parsed.messages && Array.isArray(parsed.messages)) {
+    for (const msg of parsed.messages) {
+      if (!Array.isArray(msg.content)) continue;
+      for (const block of msg.content) {
+        if (block.type === "text" && typeof block.text === "string") {
+          block.text = maybeUnquoteText(block.text);
+          delete block.cache_control;
+        }
+        if (block.type === "tool_use" && block.name) {
+          options.translateToolUse?.(block);
+        }
+        // tool_result blocks reference tool names via tool_use_id,
+        // no name translation needed here.
+      }
+    }
+  }
+}
+
+/** Point a Messages API URL at the beta endpoint Claude Code uses. */
+export function buildClaudeUrl(url: string): string {
+  let requestUrl: URL | null = null;
+  try {
+    requestUrl = new URL(url);
+  } catch {}
+
+  if (requestUrl?.pathname === "/messages") {
+    requestUrl.pathname = "/v1/messages";
+  }
+  if (requestUrl?.pathname === "/v1/messages" && !requestUrl.searchParams.has("beta")) {
+    requestUrl.searchParams.set("beta", "true");
+  }
+  return requestUrl?.toString() ?? url;
 }

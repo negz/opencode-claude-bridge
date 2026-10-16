@@ -8,27 +8,17 @@ import {
 } from "./oauth.js";
 import { getClaudeTokens, readClaudeCredentials } from "./keychain.js";
 import {
-  ANTHROPIC_VERSION,
-  STAINLESS_HEADERS,
-  USER_AGENT,
-  DEFAULT_EFFORT,
-  CLEAR_THINKING_TYPE,
   SESSION_ID,
   PLUGIN_ID,
 } from "./constants.js";
 import {
   CLAUDE_PREFIX,
-  buildBetaFlags,
-  buildBillingHeader,
-  fetchOAuthProfile,
+  buildClaudeHeaders,
+  buildClaudeUrl,
   getStableDeviceId,
-  maybeUnquoteText,
   mergeHeaders,
-  normalizeSystemBlocks,
   readCachedClaudePromptCache,
-  rewriteSystemBlocksForModel,
-  stripAssistantPrefillForClaude,
-  stripSystemCacheControl,
+  shapeClaudeBody,
 } from "./request.js";
 
 export {
@@ -42,8 +32,6 @@ import {
   getClaudeTools,
   translateArgsOpencodeToClaude,
   translateToolArgsJsonString,
-  computeFingerprint,
-  extractFirstUserMessageText,
   shouldUseClaudeToolSchemas,
 } from "./claude-tools.js";
 import type { ToolDefinition } from "./claude-tools.js";
@@ -387,7 +375,6 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
   const sessionId = SESSION_ID || randomUUID();
   const deviceId = getStableDeviceId();
   const cachedClaudePromptCache = readCachedClaudePromptCache();
-  const cachedClaudeSystem = cachedClaudePromptCache?.system || null;
 
   // Bootstrap auth from Claude CLI keychain at plugin init time — before
   // OpenCode builds its provider state. This ensures the loader runs on
@@ -478,25 +465,15 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
               return buildAuthFailureResponse("No usable OAuth access token is available.");
             }
 
-            // ── Headers ──
-            const headers = new Headers();
-            if (input instanceof Request) mergeHeaders(headers, input.headers);
-            if (init?.headers) mergeHeaders(headers, init.headers);
+            const url = typeof input === "string" ? input
+              : input instanceof URL ? input.toString()
+              : input.url;
 
-            headers.set("authorization", `Bearer ${accessToken}`);
-            headers.delete("x-api-key");
-            headers.delete("x-session-affinity");
-            headers.delete("x-session-id");
-            if (!headers.has("accept")) headers.set("accept", "application/json");
-            headers.set("user-agent", USER_AGENT);
-            headers.set("x-app", "cli");
-            headers.set("x-claude-code-session-id", sessionId);
-            headers.set("anthropic-version", ANTHROPIC_VERSION);
-            headers.set("anthropic-dangerous-direct-browser-access", "true");
-            for (const [k, v] of Object.entries(STAINLESS_HEADERS)) headers.set(k, v);
-            if (!headers.has("x-stainless-retry-count")) headers.set("x-stainless-retry-count", "0");
-            if (!headers.has("x-stainless-timeout")) headers.set("x-stainless-timeout", "600");
-            headers.set("anthropic-beta", buildBetaFlags(headers.get("anthropic-beta") || ""));
+            // ── Headers ──
+            const sourceHeaders = new Headers();
+            if (input instanceof Request) mergeHeaders(sourceHeaders, input.headers);
+            if (init?.headers) mergeHeaders(sourceHeaders, init.headers);
+            const headers = buildClaudeHeaders(sourceHeaders, accessToken, sessionId);
 
             // ── Body ──
             let body = init?.body;
@@ -506,175 +483,46 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
                 const parsed = JSON.parse(body);
                 let requestUrl = "";
                 try {
-                  requestUrl = String(
-                    new URL(
-                      typeof input === "string" ? input
-                      : input instanceof URL ? input.toString()
-                      : input.url,
-                    ),
-                  );
+                  requestUrl = String(new URL(url));
                 } catch {}
 
-                // Only inject adaptive thinking for models that support it.
-                // Use an explicit allowlist — haiku and older sonnet variants
-                // (e.g. claude-sonnet-4-5) reject the field entirely.
-                // claude-sonnet-4-6 and claude-opus-4-x are confirmed to support
-                // interleaved-thinking-2025-05-14.
-                const THINKING_MODELS = [
-                  "claude-opus-4",
-                  "claude-sonnet-4-6",
-                ];
-                const supportsThinking = parsed.model &&
-                  THINKING_MODELS.some((m: string) => parsed.model.includes(m));
-                if (!parsed.thinking && supportsThinking) {
-                  parsed.thinking = { type: "adaptive" };
-                }
-
-                // Anthropic requires temperature=1 when thinking is enabled/adaptive
-                const thinkingType = parsed.thinking?.type;
-                if (
-                  (thinkingType === "enabled" || thinkingType === "adaptive") &&
-                  parsed.temperature !== undefined &&
-                  parsed.temperature !== 1
-                ) {
-                  parsed.temperature = 1;
-                }
-
-                if (!parsed.system) parsed.system = [];
-                if (Array.isArray(parsed.messages)) {
-                  parsed.messages = stripAssistantPrefillForClaude(parsed.messages);
-                }
-                // context_management and output_config.effort are only
-                // supported by thinking-capable models. Sending them to
-                // haiku (used for title generation) produces a 400.
-                if (supportsThinking) {
-                  if (!parsed.context_management) {
-                    parsed.context_management = {
-                      edits: [{ type: CLEAR_THINKING_TYPE, keep: "all" }],
-                    };
-                  }
-                  if (!parsed.output_config) {
-                    parsed.output_config = { effort: DEFAULT_EFFORT };
-                  }
-                }
-
-                const profile = auth.access
-                  ? await fetchOAuthProfile(auth.access)
-                  : null;
-                if (!parsed.metadata) parsed.metadata = {};
-                if (!parsed.metadata.user_id && profile?.account?.uuid) {
-                  parsed.metadata.user_id = JSON.stringify({
-                    device_id: deviceId,
-                    account_uuid: profile.account.uuid,
-                    session_id: sessionId,
-                  });
-                }
-
-                // Compute dynamic fingerprint from the first user message
-                // (matches Claude Code's per-request fingerprint behavior).
-                let dynamicFingerprint: string | undefined;
-                if (parsed.messages && Array.isArray(parsed.messages)) {
-                  const firstText = extractFirstUserMessageText(parsed.messages);
-                  if (firstText) {
-                    dynamicFingerprint = computeFingerprint(firstText);
-                  }
-                }
-
-                // Inject billing header as first system block (required for OAuth).
-                const hasBilling = parsed.system.some(
-                  (s: { text?: string }) =>
-                    s.text?.startsWith("x-anthropic-billing-header:"),
-                );
-                let billingHeader = buildBillingHeader(sessionId, cachedClaudePromptCache, dynamicFingerprint);
-                if (!hasBilling) {
-                  parsed.system.unshift({
-                    type: "text",
-                    text: billingHeader,
-                  });
-                } else {
-                  billingHeader = parsed.system[0]?.text || billingHeader;
-                }
-
-                // If we have a locally captured Claude Code system prompt, prefer it.
-                if (cachedClaudeSystem) {
-                  const rewritten = rewriteSystemBlocksForModel(
-                    cachedClaudeSystem,
-                    typeof parsed.model === "string" ? parsed.model : undefined,
-                  );
-                  parsed.system = [
-                    { type: "text", text: billingHeader },
-                    ...rewritten,
-                  ];
-                } else if (parsed.system && Array.isArray(parsed.system)) {
-                  // Otherwise keep the existing prompt but shape it closer to Claude Code.
-                  parsed.system = normalizeSystemBlocks(parsed.system);
-                }
-                parsed.system = stripSystemCacheControl(parsed.system);
-
-                // Keep OpenCode's default tool schemas for non-Claude targets.
-                // Claude wire schemas are only useful for Anthropic-native
-                // requests or Claude-family models on Anthropic-compatible
-                // routers such as OpenRouter.
-                if (shouldInjectClaudeTools({ model: parsed.model, requestUrl, tools: parsed.tools })) {
-                  inboundToolNameMap = getInboundToolNameMapForActiveOpenCodeTools(parsed.tools);
-                  parsed.tools = getClaudeToolsForActiveOpenCodeTools(parsed.tools);
-                }
-                delete parsed.tool_choice;
-
-                // Normalize message content blocks:
-                // - Translate tool names (OpenCode → Claude Code)
-                // - Translate tool_use input arguments (camelCase → snake_case)
-                // - Clean up text blocks
-                if (parsed.messages && Array.isArray(parsed.messages)) {
-                  for (const msg of parsed.messages) {
-                    if (!Array.isArray(msg.content)) continue;
-                    for (const block of msg.content) {
-                      if (block.type === "text" && typeof block.text === "string") {
-                        block.text = maybeUnquoteText(block.text);
-                        delete block.cache_control;
-                      }
-                      if (block.type === "tool_use" && block.name) {
-                        block.name = mapOutboundToolName(block.name);
-                        // Consolidated OpenCode → Claude argument translation:
-                        // key renames, Agent/AskUserQuestion/Skill/WebFetch/TodoWrite
-                        // field bridging. Mirrors translateToolArgsJsonString
-                        // (inbound) so round-trips preserve meaning. See
-                        // translateArgsOpencodeToClaude in claude-tools.ts.
-                        if (block.input && typeof block.input === "object") {
-                          block.input = translateArgsOpencodeToClaude(
-                            block.name,
-                            block.input as Record<string, unknown>,
-                          );
-                        }
-                      }
-                      // tool_result blocks reference tool names via tool_use_id,
-                      // no name translation needed here.
+                await shapeClaudeBody(parsed, requestUrl, {
+                  sessionId,
+                  deviceId,
+                  accessToken: auth.access,
+                  cachedClaudePromptCache,
+                  // Keep OpenCode's default tool schemas for non-Claude targets.
+                  // Claude wire schemas are only useful for Anthropic-native
+                  // requests or Claude-family models on Anthropic-compatible
+                  // routers such as OpenRouter.
+                  replaceTools: (parsed, requestUrl) => {
+                    delete parsed.tool_choice;
+                    if (!shouldInjectClaudeTools({ model: parsed.model, requestUrl, tools: parsed.tools })) return;
+                    inboundToolNameMap = getInboundToolNameMapForActiveOpenCodeTools(parsed.tools);
+                    parsed.tools = getClaudeToolsForActiveOpenCodeTools(parsed.tools);
+                  },
+                  translateToolUse: (block) => {
+                    block.name = mapOutboundToolName(block.name);
+                    // Consolidated OpenCode → Claude argument translation:
+                    // key renames, Agent/AskUserQuestion/Skill/WebFetch/TodoWrite
+                    // field bridging. Mirrors translateToolArgsJsonString
+                    // (inbound) so round-trips preserve meaning. See
+                    // translateArgsOpencodeToClaude in claude-tools.ts.
+                    if (block.input && typeof block.input === "object") {
+                      block.input = translateArgsOpencodeToClaude(
+                        block.name,
+                        block.input as Record<string, unknown>,
+                      );
                     }
-                  }
-                }
+                  },
+                });
 
                 body = JSON.stringify(parsed);
               } catch {}
             }
 
             // ── URL: add ?beta=true ──
-            let requestUrl: URL | null = null;
-            try {
-              requestUrl = new URL(
-                typeof input === "string" ? input
-                  : input instanceof URL ? input.toString()
-                  : input.url,
-              );
-            } catch {}
-
-            if (requestUrl?.pathname === "/messages") {
-              requestUrl.pathname = "/v1/messages";
-            }
-            if (requestUrl?.pathname === "/v1/messages" && !requestUrl.searchParams.has("beta")) {
-              requestUrl.searchParams.set("beta", "true");
-            }
-            const finalUrl = requestUrl?.toString()
-              ?? (input instanceof Request ? input.url : String(input));
+            const finalUrl = buildClaudeUrl(url);
 
             // ── Request (with 429 auto-refresh retry) ──
             const outHeaders: Record<string, string> = {};
