@@ -14,6 +14,14 @@ Add to `~/.config/opencode/opencode.json`:
 
 OpenCode auto-installs the plugin from npm on next launch.
 
+OpenCode 2 accepts that too, though its own key is `plugins`.
+
+On OpenCode 2 the bridge registers the Claude OAuth method, refreshes the
+credential (from the Claude CLI first), and shapes each OAuth request like
+Claude Code's. It keeps OpenCode 2's own tool definitions rather than swapping
+in Claude Code's. OpenCode 2 imports an existing OpenCode 1 Claude login on
+first start.
+
 If you're logged into the Claude CLI (`claude login`), the plugin auto-syncs your credentials — just select an Anthropic model and start chatting. If not, you'll be prompted to authenticate via browser OAuth or enter an API key.
 
 **Upgrade:**

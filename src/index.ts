@@ -36,6 +36,7 @@ import {
 } from "./claude-tools.js";
 import type { ToolDefinition } from "./claude-tools.js";
 import { createSseProcessor } from "./stream.js";
+import { setup } from "./v2.js";
 
 // ── Types ──────────────────────────────────────────────────────────
 
@@ -763,12 +764,15 @@ const OpenCodeClaudeBridge = async ({ client }: { client: PluginClient }) => {
 /**
  * opencode plugin module.
  *
- * The `{ id, server }` shape is what opencode's plugin loader looks for. A bare
- * function default export makes it fall back to its legacy path, which treats
- * every named export of this module as a plugin factory and invokes it with
- * `(input, options)` — crashing on the helpers exported here for tests.
+ * The `{ id, server }` shape is what OpenCode 1's plugin loader looks for. A
+ * bare function default export makes it fall back to its legacy path, which
+ * treats every named export of this module as a plugin factory and invokes it
+ * with `(input, options)` — crashing on the helpers exported here for tests.
+ *
+ * OpenCode 2 calls `setup` instead, so one package serves both.
  */
 export default {
   id: PLUGIN_ID,
   server: OpenCodeClaudeBridge,
+  setup,
 };
